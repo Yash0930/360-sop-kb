@@ -328,6 +328,7 @@ document.addEventListener('keydown', function(e) {
   <div class="glob-item" onclick="showSec('global-loas')"><span>📄</span>Number Procurement Forms (All Teams)</div>
   <div class="glob-item" onclick="showSec('global-msgflow')"><span>📲</span>SMS Message Flow (All Teams)</div>
   <div class="glob-item" onclick="showSec('global-textolic')"><span>📱</span>Textolic Session Timeout SOP (All Teams)</div>
+  <div class="glob-item" onclick="showSec('global-analyzer')"><span>📊</span>SMS Delivery Analyzer Tool (All Teams)</div>
   <div class="glob-item" onclick="showSingleCard('a-cti','automation')"><span>📞</span>CTI Voice Agent Guide (All Teams)</div>
   <div class="glob-item" onclick="showSingleCard('a-inc','automation')"><span>📨</span>Incoming SMS Troubleshooting (All Teams)</div>
   
@@ -1261,6 +1262,26 @@ No action required if credits already removed."</div></div>
           </tbody>
         </table>
 
+      </div>
+    </div>
+  </div>
+
+  <!-- GLOBAL: SMS Delivery Analyzer Tool -->
+  <div class="dept-sec" id="sec-global-analyzer">
+    <div class="glob-banner">🌐 <strong>Global Resource</strong> — Interactive diagnostic tool. Opens in a new tab so it never slows down this SOP.</div>
+    <div class="dept-banner"><div class="dept-ic global">📊</div><div><h2>SMS Delivery Analysis Engine</h2><p>All Departments — Internal Tool</p></div></div>
+    <div class="sop-card open" id="g-analyzer">
+      <div class="card-hdr" onclick="toggleCard('g-analyzer')"><div class="card-ic">📊</div><div class="card-meta"><div class="card-title">360 SMS — Delivery Analysis Engine</div><div class="card-desc">Interactive tool to diagnose SMS delivery issues — paste message/delivery data and get analysis of failures and delivery status. Standalone diagnostic utility for the CSM &amp; Support teams.</div><div class="card-tags"><span class="tag int">🔒 Internal Only</span><span class="tag gtag">🌐 All Departments</span><span class="tag type">Interactive Tool</span><span class="tag dri">🎯 CSM + Support</span></div><div class="card-actions"><button class="dl-btn" onclick="window.open('analyzer.html','_blank');event.stopPropagation();">🚀 Open Delivery Analyzer</button></div></div><div class="exp-btn"><span class="exp-ic">▼</span></div></div>
+      <div class="card-body">
+        <h3>ℹ️ About This Tool</h3>
+        <div class="info-box">
+          The <strong>Delivery Analysis Engine</strong> is a self-contained interactive tool that helps you diagnose SMS delivery problems quickly. Because it's a heavier interactive utility, it lives as a separate page and <strong>opens in a new browser tab</strong> — this keeps the main SOP fast to load while giving you the full tool on demand.
+        </div>
+        <h3>🚀 How to Use</h3>
+        <div class="step-box"><div class="step-lbl">STEP 1 — Open the Tool</div><p>Click the <strong>🚀 Open Delivery Analyzer</strong> button above. It opens in a new tab so you can keep this SOP open alongside it.</p></div>
+        <div class="step-box"><div class="step-lbl">STEP 2 — Run Your Analysis</div><p>Follow the on-screen prompts in the analyzer to paste in delivery data and review the diagnostic output.</p></div>
+        <div class="warn-box"><span>🔒</span><div>Internal use only. Do not share the analyzer link or its output with clients directly.</div></div>
+        <div style="text-align:center;margin-top:16px"><button class="dl-btn" style="font-size:14px;padding:10px 22px" onclick="window.open('analyzer.html','_blank')">🚀 Open Delivery Analyzer in New Tab</button></div>
       </div>
     </div>
   </div>
