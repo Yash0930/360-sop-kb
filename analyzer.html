@@ -1461,6 +1461,16 @@ let deliveryChart = null;
 let errorChart    = null;
 
 // ════════════════════════════════════════════════════════════
+//  AI COMPLIANCE LAYER CONFIG
+//  Set to your Cloudflare Worker URL (behind Cloudflare Access) to enable
+//  AI-assisted compliance analysis. Leave '' to disable — the tool then
+//  behaves exactly as it does without this layer (no breakage, graceful
+//  degrade). Set to 'MOCK' to test the UI wiring with canned responses
+//  before the Worker is deployed.
+// ════════════════════════════════════════════════════════════
+const WORKER_URL = '';
+
+// ════════════════════════════════════════════════════════════
 //  UI HELPERS
 // ════════════════════════════════════════════════════════════
 function setStatus(msg, type='info') {
@@ -2060,10 +2070,74 @@ async function generateReport() {
       messageSamples.push({text, outcome:sorted[0]._c.outcome, code:sorted[0]._c.code, dest:gf(sorted[0],'destination')});
     });
   } else {
-    outgoing.filter(r=>r._c.outcome!=='delivered').slice(0,50).forEach(r=>{
+    outgoing.filter(r=>r._c.outcome!=='delivered').forEach(r=>{
       messageSamples.push({text:gf(r, cfg.messageTextField), outcome:r._c.outcome, code:r._c.code, dest:gf(r,'destination')||gf(r,'to')});
     });
   }
+
+  // ── SELECT DIVERSE, DEDUPLICATED SAMPLES ────────────────────────────────
+  // Problem: raw samples are often identical auto-responses (STOP confirmations)
+  // that cluster together. We want DIFFERENT messages across DIFFERENT codes so
+  // the user can see varied content issues, not the same message five times.
+  messageSamples = (function selectContentFailures(samples) {
+    // ── ONLY show messages that failed due to SPAM / CARRIER FILTERING / CONTENT ──
+    // These are the only failures where the message wording is the actual problem
+    // and where showing it helps the user fix their content. Invalid numbers,
+    // opt-outs, unreachable handsets, size/encoding, billing, and registration
+    // errors are excluded — the message text is irrelevant to those.
+    const CONTENT_FAILURE_CODES = new Set([
+      // Aerialink — spam / carrier content filtering
+      '012','042','044','045','054','068','06B','47E','480','PLATFORM_FILTERED',
+      // Twilio — spam / content filtering
+      '30007','30021','30040','30041','30026','30028',
+      // Vonage — anti-spam / provider content block / rejected
+      '6','17','ST_REJECTD'
+    ]);
+
+    // Keep only content-failure messages with actual text
+    const norm = t => String(t||'').trim().toLowerCase().replace(/\s+/g,' ');
+    const seen = new Set();
+    const filtered = [];
+    for (const s of samples) {
+      if (!CONTENT_FAILURE_CODES.has(s.code)) continue;   // only content/spam/filter codes
+      const key = norm(s.text);
+      if (!key || key.length < 5) continue;               // skip empty
+      if (seen.has(key)) continue;                        // dedupe identical text
+      seen.add(key);
+      filtered.push(s);
+    }
+
+    // Fisher-Yates shuffle so each run surfaces a different random subset
+    for (let i = filtered.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [filtered[i], filtered[j]] = [filtered[j], filtered[i]];
+    }
+
+    // Spread across the distinct content codes so we show variety, not 5 of one code
+    const byCode = {};
+    filtered.forEach(s => { (byCode[s.code] = byCode[s.code] || []).push(s); });
+    const codesOrdered = Object.keys(byCode);
+    // Shuffle the code order too so which code leads varies each run
+    for (let i = codesOrdered.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [codesOrdered[i], codesOrdered[j]] = [codesOrdered[j], codesOrdered[i]];
+    }
+
+    const diverse = [];
+    let added = true, round = 0;
+    while (added && diverse.length < 8) {
+      added = false;
+      for (const code of codesOrdered) {
+        if (byCode[code][round]) {
+          diverse.push(byCode[code][round]);
+          added = true;
+          if (diverse.length >= 8) break;
+        }
+      }
+      round++;
+    }
+    return diverse;
+  })(messageSamples);
 
   // Also sample delivered messages for 10DLC checks
   const allSamples = outgoing.slice(0,200).map(r=>gf(r, cfg.messageTextField));
@@ -2180,11 +2254,288 @@ async function generateReport() {
   document.getElementById('generateBtn').disabled = false;
   document.getElementById('previewSection').classList.add('show');
   document.getElementById('previewSection').scrollIntoView({behavior:'smooth', block:'start'});
+
+  // Fire-and-forget: enrich the rendered report with AI compliance analysis.
+  // Non-blocking — the report above is already complete and usable without it.
+  runAIComplianceAnalysis(reportData).catch(err => console.error('AI compliance analysis failed:', err));
 }
 
 // ════════════════════════════════════════════════════════════
 //  RENDER HTML REPORT
 // ════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════
+//  RULE-BASED MESSAGE COMPLIANCE REWRITE
+//  Detects why a message would be carrier-filtered and produces a
+//  compliant "should look like this" version. Fully offline/deterministic.
+// ════════════════════════════════════════════════════════════
+function analyzeAndFixMessage(text, brandName, useCase) {
+  const original = String(text || '');
+  let fixed = original;
+  const violations = [];
+
+  // ── STEP 1: Detect the sender/brand ALREADY IN the message ────────────────
+  // Prefer what the message actually uses over the form value, so the rewrite
+  // does not contradict the real signature (e.g. "-Chris NYCFC").
+  function detectSender(msg) {
+    // Spam words that must never be mistaken for a brand name
+    const NOT_A_BRAND = /^(urgent|free|winner|congrats|congratulations|act|claim|prize|hi|hello|hey|reply|text|stop|new|buy|sale|offer|limited|click|visit|call|www|http)/i;
+    const clean = s => s.replace(/\s+/g,' ').trim().replace(/[.,!?;:]+$/,'').trim();
+    const valid = s => s && s.length >= 2 && s.length <= 40 && !NOT_A_BRAND.test(s);
+
+    // 1. Trailing signature: "-Chris NYCFC", "- NYCFC", "— The NYCFC Team"
+    let m = msg.match(/[-—–]\s*([A-Z][A-Za-z0-9&.'\s]{1,38})\s*$/);
+    if (m) { const s = clean(m[1]); if (valid(s)) return s; }
+
+    // 2. "from NYCFC", "this is Chris from Acme Corp", "on behalf of NYCFC"
+    m = msg.match(/\b(?:from|on behalf of)\s+([A-Z][A-Za-z0-9&.'\s]{1,30}?)(?:[.,!?]|\s+(?:reply|text|to|and|we|you|your|is|has|team)\b|$)/);
+    if (m) { const s = clean(m[1]); if (valid(s)) return s; }
+
+    // 3. Leading "NYCFC:" prefix (but not a spam word)
+    m = msg.match(/^\s*([A-Z][A-Za-z0-9&.\s]{1,30}?):/);
+    if (m) { const s = clean(m[1]); if (valid(s)) return s; }
+
+    return null;
+  }
+
+  const senderInMsg = detectSender(original);
+  const formBrand = (brandName && brandName.trim()) ? brandName.trim() : '';
+  const formBrandInMsg = formBrand && original.toLowerCase().includes(formBrand.toLowerCase());
+
+  // Detect an org token already in the body (e.g. NYCFC) so we don't prepend a
+  // conflicting form brand. Looks for ALL-CAPS acronyms (3-6 letters) or a
+  // capitalised brand-like word that is not a common word or spam word.
+  function orgTokenInBody(msg) {
+    const acr = msg.match(/\b[A-Z]{3,6}\b/g) || [];
+    const COMMON = /^(STOP|HELP|YES|FREE|CASH|NOW|OFF|USA|SMS|MMS|OTP|URL|WON|WIN)$/;
+    for (const a of acr) { if (!COMMON.test(a)) return a; }
+    return null;
+  }
+  const bodyOrg = orgTokenInBody(original);
+
+  // Effective brand: sender in message > form value > generic
+  const brand = senderInMsg || formBrand || 'Your Brand';
+  // Already branded if: detected sender, form brand appears, OR a distinct org token exists in body
+  const alreadyBranded = !!senderInMsg || formBrandInMsg || !!bodyOrg;
+
+  // ── STEP 2: Detect & surgically fix each violation ────────────────────────
+
+  // Unbranded URL shorteners → replace with a branded placeholder
+  const shortenerRe = /\b(?:bit\.ly|tinyurl\.com|goo\.gl|t\.co|ow\.ly|buff\.ly|is\.gd|cli\.gs|tiny\.cc)\/\S*/gi;
+  if (shortenerRe.test(fixed)) {
+    violations.push('Unbranded URL shortener (carriers flag these as spam)');
+    const domain = (brand.replace(/[^A-Za-z0-9]/g,'') || 'brand').toLowerCase();
+    fixed = fixed.replace(shortenerRe, domain + '.com/link');
+  }
+
+  // Excessive ALL-CAPS words (6+ chars) → sentence case (keep first letter)
+  if (/\b[A-Z]{6,}\b/.test(original)) {
+    violations.push('Excessive ALL-CAPS (looks like shouting / spam)');
+    fixed = fixed.replace(/\b[A-Z]{6,}\b/g, w => w.charAt(0) + w.slice(1).toLowerCase());
+  }
+
+  // Spam symbol runs ($$$, !!!, ???) → single punctuation
+  if (/[$]{2,}|[!]{2,}|[?]{2,}/.test(fixed)) {
+    violations.push('Repeated spam symbols ($$$, !!!, ???)');
+    fixed = fixed.replace(/\${2,}/g, '$').replace(/!{2,}/g, '!').replace(/\?{2,}/g, '?');
+  }
+
+  // Spam trigger words → soften the worst offenders in place
+  const spamWords = /\b(free|winner|won|congrats|congratulations|claim|prize|urgent|act now|limited time|cash|guaranteed|risk-free|100%|click here)\b/gi;
+  const foundSpam = (original.match(spamWords) || []);
+  if (foundSpam.length > 0) {
+    violations.push('Spam trigger words: ' + [...new Set(foundSpam.map(w=>w.toLowerCase()))].slice(0,4).join(', '));
+    // Soften common spam phrases while keeping the sentence readable
+    const softenMap = [
+      [/\bact now\b/gi, 'learn more'],
+      [/\bclick here\b/gi, 'see details'],
+      [/\bguaranteed\b/gi, ''],
+      [/\brisk-free\b/gi, ''],
+      [/\b100%\b/gi, ''],
+      [/\bwinner\b/gi, ''],
+      [/\bcongratulations\b/gi, 'Hello'],
+      [/\bcongrats\b/gi, 'Hello'],
+      [/\bwon a\b/gi, 'have a'],
+      [/\bwon\b/gi, 'have'],
+      [/\bfree\b/gi, 'complimentary'],
+      [/\bprize\b/gi, 'offer'],
+      [/\bclaim\b/gi, 'redeem'],
+      [/\bcash\b/gi, 'savings'],
+      [/\burgent:?\b/gi, ''],
+      [/\blimited time\b/gi, 'for a limited time'],
+    ];
+    softenMap.forEach(([re, rep]) => { fixed = fixed.replace(re, rep); });
+  }
+
+  // ── STEP 3: Ensure brand identification ───────────────────────────────────
+  if (!alreadyBranded) {
+    violations.push('No sender/brand identification');
+  }
+
+  // ── STEP 4: Ensure opt-out ────────────────────────────────────────────────
+  const hasOptOut = /reply\s*(stop|end|cancel|unsubscribe|quit)|text\s*stop|opt.?out/i.test(fixed);
+  if (!hasOptOut) {
+    violations.push('No opt-out instruction (required by carriers/CTIA)');
+  }
+
+  // ── STEP 5: Assemble the corrected message ────────────────────────────────
+  // Clean whitespace/punctuation left by removals
+  fixed = fixed.replace(/\s{2,}/g, ' ').replace(/\s+([.,!?])/g, '$1').replace(/([.,!?]){2,}/g, '$1').trim();
+  // Remove empty leftover fragments like " ,  " or leading punctuation
+  fixed = fixed.replace(/^[\s,.;:!?-]+/, '').trim();
+
+  // Decide strategy: salvage in place, or use a use-case template if the
+  // original is too degraded (very short after cleaning, or 3+ spam triggers)
+  const tooDegraded = foundSpam.length >= 3 || fixed.replace(/[^A-Za-z]/g,'').length < 12;
+
+  if (tooDegraded) {
+    fixed = complianceTemplate(brand, useCase, original);
+  } else {
+    // Capitalise first letter
+    fixed = fixed.charAt(0).toUpperCase() + fixed.slice(1);
+    // Prepend brand only if the message identifies no sender at all
+    if (!alreadyBranded) {
+      fixed = brand + ': ' + fixed.charAt(0).toLowerCase() + fixed.slice(1);
+    }
+    // Append opt-out if missing
+    if (!hasOptOut) fixed = fixed.replace(/\s*$/, '').replace(/([^.!?])$/, '$1.') + ' Reply STOP to opt out.';
+  }
+
+  return { original, fixed, violations, detectedSender: senderInMsg };
+}
+
+// Compliant message templates varied by campaign use case (offline, no AI).
+// Used only when the original message is too spam-degraded to salvage in place.
+function complianceTemplate(brand, useCase, original) {
+  const uc = String(useCase || '').toLowerCase();
+  const hasLink = /https?:\/\/\S+/.test(original) || /\b(?:bit\.ly|tinyurl|goo\.gl|link)\b/i.test(original);
+  const linkPart = hasLink ? ('View details: ' + (brand.replace(/[^A-Za-z0-9]/g,'')||'brand').toLowerCase() + '.com/link. ') : '';
+  const optOut = 'Reply STOP to opt out.';
+  const b = brand + ': ';
+
+  // Pick a template family based on the declared use case (most specific first)
+  let body;
+  if (/delivery|shipping|order|dispatch/.test(uc)) {
+    body = 'here is an update on your order. ' + linkPart;
+  } else if (/appointment|reminder|booking|schedul/.test(uc)) {
+    body = 'this is a reminder about your upcoming appointment. ' + linkPart;
+  } else if (/security|fraud|2fa|authentication|otp|verification/.test(uc)) {
+    body = 'this is a security notification for your account. ' + linkPart;
+  } else if (/support|care|service/.test(uc)) {
+    body = 'we are following up on your recent request. ' + linkPart;
+  } else if (/poll|voting|survey|feedback/.test(uc)) {
+    body = 'we would value your feedback. ' + linkPart;
+  } else if (/market|promo|sale|offer/.test(uc)) {
+    body = 'we have a new offer available for you. ' + linkPart;
+  } else if (/account|notification|alert/.test(uc)) {
+    body = 'this is an update regarding your account. ' + linkPart;
+  } else {
+    body = 'thank you for being a customer. ' + linkPart;
+  }
+  return b + 'Hi! ' + body.charAt(0).toUpperCase() + body.slice(1) + optOut;
+}
+
+// ════════════════════════════════════════════════════════════
+//  AI COMPLIANCE ANALYSIS (optional, additive)
+//  Batches the same deduped message samples already used for the offline
+//  rewrite above to the Cloudflare Worker (see WORKER_URL) for AI-assisted
+//  classification against the full flag taxonomy. Purely additive: if
+//  WORKER_URL is empty, this is a no-op and the tool behaves exactly as it
+//  does without this layer.
+// ════════════════════════════════════════════════════════════
+function mockAIComplianceResult(m) {
+  return {
+    original: m.text,
+    verdict: 'HIGH-RISK',
+    sender_in_message: null,
+    brand_mismatch: false,
+    mismatch_detail: null,
+    flags: [
+      { code: 'FORMAT_NO_BRAND', section: '9.1', cause: 'No sending brand identified in message text', suspected: false },
+      { code: 'REG_CAMPAIGN_UNREGISTERED', section: '12.1', cause: 'Content is clean; filtering pattern is consistent with registration-gate blocking', suspected: true }
+    ],
+    why_filtered: '[MOCK] This is a canned response for UI testing (WORKER_URL=MOCK). No sending brand is named, which raises spam scores. The remaining risk cannot be confirmed from message text alone and requires checking campaign registration status.',
+    suggested_rewrite: 'Acme: ' + m.text.slice(0, 130) + (m.text.length > 130 ? '…' : ''),
+    rewrite_fixes: [ { code: 'FORMAT_NO_BRAND', change: 'Added brand name prefix' } ],
+    cannot_fix: [ { code: 'REG_CAMPAIGN_UNREGISTERED', action: 'Verify 10DLC campaign registration/vetting status in carrier portal' } ],
+    confidence: 'medium',
+    verify_against: '10DLC campaign registration status; recent opt-out/complaint history'
+  };
+}
+
+function renderAIPanel(el, r) {
+  if (!r) {
+    el.innerHTML = '<span style="color:var(--red)">AI analysis unavailable for this message.</span>';
+    return;
+  }
+  const verdictColor = { 'BLOCK-LIKELY':'#B91C1C', 'HIGH-RISK':'#D97706', 'LOW-RISK':'#2E844A', 'CLEAN':'#2E844A' }[r.verdict] || 'var(--ink-soft)';
+  const flagsHtml = (r.flags||[]).map(f => `
+    <span style="font-size:10px;background:#EFF6FF;color:#1D4ED8;border:1px solid #BFDBFE;border-radius:4px;padding:2px 8px;margin:2px 4px 2px 0;display:inline-block">
+      ${esc(f.code)} <span style="opacity:0.7">§${esc(f.section)}</span>${f.suspected ? ' <b style="color:#B45309">(suspected)</b>' : ''}
+    </span>`).join('');
+  const cannotFixHtml = (r.cannot_fix||[]).length ? `
+    <div style="margin-top:8px"><strong style="font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--ink-soft)">Cannot be fixed by rewriting:</strong>
+      <ul style="margin:4px 0 0 18px;padding:0;font-size:11px">
+        ${r.cannot_fix.map(c => `<li>${esc(c.code)} — ${esc(c.action)}</li>`).join('')}
+      </ul>
+    </div>` : '';
+  const rewriteHtml = r.suggested_rewrite ? `
+    <div style="margin-top:8px;padding:8px 10px;background:#F0FDF4;border-left:3px solid #2E844A;border-radius:4px">
+      <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#2E844A;margin-bottom:4px">AI-suggested rewrite</div>
+      <div style="font-size:12px;color:var(--ink)">${esc(r.suggested_rewrite)}</div>
+    </div>` : '';
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:6px">
+      <span style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-soft)">&#129504; AI Compliance Analysis</span>
+      <span style="font-size:10px;font-weight:700;color:${verdictColor}">${esc(r.verdict)} &middot; confidence: ${esc(r.confidence)}</span>
+    </div>
+    <div style="margin-bottom:6px">${flagsHtml}</div>
+    <div style="font-size:11px;color:var(--ink-mid);line-height:1.5">${esc(r.why_filtered)}</div>
+    ${r.brand_mismatch ? `<div style="margin-top:6px;font-size:11px;color:#B91C1C">Brand mismatch: ${esc(r.mismatch_detail||'')}</div>` : ''}
+    ${rewriteHtml}
+    ${cannotFixHtml}
+    <div style="margin-top:8px;font-size:10px;color:var(--ink-soft)">Verify against: ${esc(r.verify_against||'—')}</div>
+  `;
+}
+
+async function runAIComplianceAnalysis(d) {
+  if (!WORKER_URL || !d) return;
+
+  const samples = d.messageSamples.slice(0,8).filter(m=>m.text && m.text.trim().length>5);
+  if (samples.length === 0) return;
+
+  let results;
+  if (WORKER_URL === 'MOCK') {
+    await sleep(400);
+    results = samples.map(mockAIComplianceResult);
+  } else {
+    const res = await fetch(WORKER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: samples.map(m => ({ text: m.text, code: m.code, dest: m.dest })),
+        brandName: d.customerName,
+        useCase: d.campaignCase,
+        channel: '10DLC'
+      })
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(()=>({error:'Unknown error'}));
+      samples.forEach((m,i) => {
+        const el = document.getElementById('ai-panel-'+i);
+        if (el) el.innerHTML = `<span style="color:var(--red)">AI analysis unavailable: ${esc(errBody.error || res.statusText)}</span>`;
+      });
+      return;
+    }
+    const body = await res.json();
+    results = body.results;
+  }
+
+  samples.forEach((m,i) => {
+    const el = document.getElementById('ai-panel-'+i);
+    if (el) renderAIPanel(el, results && results[i]);
+  });
+}
+
 function renderReportHTML() {
   const d = reportData;
   const cfg = d.cfg;
@@ -2367,16 +2718,36 @@ function renderReportHTML() {
 
       ${d.messageSamples.length>0 ? `
       <div class="content-analysis-box" style="margin-top:12px">
-        <div class="ca-header"><span>Sample Failed / Filtered Message Content</span><span>${Math.min(d.messageSamples.length,5)} of ${d.messageSamples.length} shown</span></div>
+        <div class="ca-header"><span>Messages Failed Due to Spam / Carrier Content Filtering</span><span>${Math.min(d.messageSamples.length,8)} of ${d.messageSamples.length} shown &middot; refreshes each run</span></div>
         <div class="ca-body">
-          ${d.messageSamples.slice(0,5).filter(m=>m.text && m.text.trim().length>5).map((m,i)=>`
-            <div style="margin-bottom:12px;padding:10px 14px;background:#F8FAFC;border-radius:6px;border-left:3px solid ${m.outcome==='delivered'?'#15803D':m.code?.includes('FILTER')||m.code==='045'||m.code==='30007'?'#B91C1C':'#D97706'}">
-              <div style="font-size:10px;color:var(--ink-soft);margin-bottom:4px;font-family:'JetBrains Mono',monospace">
-                Sample ${i+1} · Code: ${esc(m.code)} · Dest: ${esc(String(m.dest||'').replace(/(\d{3})\d{6}(\d{2})/,'$1****$2'))}
+          <div style="font-size:11px;color:var(--ink-soft);margin-bottom:14px;padding:8px 12px;background:var(--sf-blue-pale);border-radius:6px;line-height:1.5">
+            Each flagged message is shown with a compliant rewrite. The <strong style="color:#B91C1C">red</strong> version is what was sent and filtered; the <strong style="color:#2E844A">green</strong> version shows how to word it to pass carrier filtering.
+          </div>
+          ${d.messageSamples.slice(0,8).filter(m=>m.text && m.text.trim().length>5).map((m,i)=>{
+            const rw = analyzeAndFixMessage(m.text, d.customerName, d.campaignCase);
+            return `
+            <div style="margin-bottom:18px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+              <div style="font-size:10px;color:var(--ink-soft);padding:8px 14px;background:#F1F5F9;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px">
+                <span>Example ${i+1} &middot; Code: ${esc(m.code)} &middot; Dest: ${esc(String(m.dest||'').replace(/(\d{3})\d{6}(\d{2})/,'$1****$2'))}</span>
               </div>
-              <div style="font-size:12px;line-height:1.6">${esc(m.text.slice(0,350))}${m.text.length>350?'…':''}</div>
-            </div>
-          `).join('')}
+              ${rw.violations.length>0 ? `
+              <div style="padding:10px 14px 4px 14px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+                <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--ink-soft)">Why filtered:</span>
+                ${rw.violations.map(v=>`<span style="font-size:10px;background:#FEF1EE;color:#B91C1C;border:1px solid #F5C6C0;border-radius:4px;padding:2px 8px">${esc(v)}</span>`).join('')}
+              </div>` : ''}
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:0">
+                <div style="padding:12px 14px;border-right:1px solid var(--border);border-left:3px solid #B91C1C">
+                  <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#B91C1C;margin-bottom:6px">&#10007; Sent (filtered)</div>
+                  <div style="font-size:12px;line-height:1.6;color:var(--ink-mid)">${esc(m.text.slice(0,350))}${m.text.length>350?'…':''}</div>
+                </div>
+                <div style="padding:12px 14px;border-left:3px solid #2E844A;background:#FBFDFB">
+                  <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#2E844A;margin-bottom:6px">&#10003; Compliant rewrite</div>
+                  <div style="font-size:12px;line-height:1.6;color:var(--ink)">${esc(rw.fixed)}</div>
+                </div>
+              </div>
+              ${WORKER_URL ? `<div id="ai-panel-${i}" class="ai-compliance-panel" style="padding:12px 14px;border-top:1px dashed var(--border);font-size:12px;color:var(--ink-soft)">Running AI compliance analysis…</div>` : ''}
+            </div>`;
+          }).join('')}
         </div>
       </div>` : ''}
     </div>
