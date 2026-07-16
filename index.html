@@ -1337,18 +1337,27 @@ const DOCS = {"onboarding": {"filename": "360_Cloud_Onboarding_Step_by_Step_Play
 var feedbackData = {};
 var feedbackFilter = 'all';
 
-var AT_KEY  = 'pat4Yvcn43wIj66qv.5f7f211f1ab2abb20206e39f90baeaeaa5e1d472a59139b0ea2a367ab0b40017';
-var AT_BASE = 'apptqHJYUSqFssEJx';
-var AT_URL  = 'https://api.airtable.com/v0/' + AT_BASE + '/';
+// ── Supabase backend (replaces Airtable — no per-call billing limit) ──
+var SB_URL = 'https://khppmblnvcfxnjbbvedh.supabase.co/rest/v1';
+var SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtocHBtYmxudmNmeG5qYmJ2ZWRoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQyMDc3NjUsImV4cCI6MjA5OTc4Mzc2NX0.73ORMn3cu9vUTdhPZkMYpagO2Y3KlxzhxtMYZu_HC8o';
 
-function atReq(table, method, body, recordId) {
-  var parts = table.split('?');
-  var url = AT_URL + encodeURIComponent(parts[0]) + (recordId ? '/' + recordId : '') + (parts[1] ? '?' + parts[1] : '');
-  return fetch(url, {
+function sbReq(path, method, body) {
+  return fetch(SB_URL + '/' + path, {
     method: method || 'GET',
-    headers: { 'Authorization': 'Bearer ' + AT_KEY, 'Content-Type': 'application/json' },
+    headers: {
+      'apikey': SB_KEY,
+      'Authorization': 'Bearer ' + SB_KEY,
+      'Content-Type': 'application/json',
+      'Prefer': 'return=representation'
+    },
     body: body ? JSON.stringify(body) : undefined
-  }).then(function(r){ return r.json(); }).catch(function(){});
+  }).then(function(r){ return r.status === 204 ? [] : r.json(); }).catch(function(){});
+}
+
+function fmtDate(iso){
+  if (!iso) return '';
+  try { return new Date(iso).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}); }
+  catch(e){ return ''; }
 }
 
 // Image map: img element id → DATA key
@@ -1447,7 +1456,7 @@ function submitFeedback(cardId, docName) {
   var entry = {id:Date.now(),cardId:cardId,docName:docName,name:name||'Anonymous',type:type,text:text,status:'open',date:new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})};
   if (!feedbackData[cardId]) feedbackData[cardId] = [];
   feedbackData[cardId].push(entry);
-  atReq('SOP Feedback', 'POST', {fields:{'Name':entry.name,'SOP Title':entry.docName,'SOPID':entry.cardId,'Status':entry.status,'Text':entry.text,'Timestamp':entry.date,'Type':entry.type}}).then(function(rec){ if(rec&&rec.id){ entry.recordId=rec.id; entry.id=rec.id; } });
+  sbReq('feedback', 'POST', {sop_title:entry.docName, sopid:entry.cardId, status:entry.status, text:entry.text, type:entry.type, author:entry.name}).then(function(rows){ if(rows&&rows[0]&&rows[0].id){ entry.recordId=rows[0].id; entry.id=rows[0].id; } });
   renderFeedbackInCard(cardId);
   updateFeedbackHub();
   updateFeedbackBadges();
@@ -1520,8 +1529,8 @@ function adminAction(fn) {
 function resolveFeedback(recordId, cardId) {
   adminAction(function() {
     if (!feedbackData[cardId]) return;
-    feedbackData[cardId].forEach(function(e){ if((e.recordId||e.id)===recordId) e.status='resolved'; });
-    if (recordId) atReq('SOP Feedback', 'PATCH', {fields:{'Status':'resolved'}}, recordId);
+    feedbackData[cardId].forEach(function(e){ if(String(e.recordId||e.id)===String(recordId)) e.status='resolved'; });
+    if (recordId) sbReq('feedback?id=eq.'+encodeURIComponent(recordId), 'PATCH', {status:'resolved'});
     renderFeedbackInCard(cardId); updateFeedbackHub();
   });
 }
@@ -1529,9 +1538,9 @@ function resolveFeedback(recordId, cardId) {
 function markMissingAdded(name, recordId, el) {
   adminAction(function() {
     if (recordId) {
-      atReq('Missing SOPs', 'PATCH', {fields:{'Status':'added'}}, recordId);
+      sbReq('missing_sops?id=eq.'+encodeURIComponent(recordId), 'PATCH', {status:'added'});
     } else {
-      atReq('Missing SOPs', 'POST', {fields:{'Name':name,'Status':'added','Timestamp':new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})}});
+      sbReq('missing_sops', 'POST', {name:name, status:'added'});
     }
     el.remove();
     updateMissingCount();
@@ -1554,14 +1563,14 @@ function filterFeedback(f, btn) {
 
 function saveFeedback() {}
 function loadFeedback() {
-  atReq('SOP Feedback?maxRecords=500').then(function(data){
-    if (!data||!data.records) return;
+  sbReq('feedback?select=*&order=id.asc').then(function(rows){
+    if (!rows||!Array.isArray(rows)) return;
     feedbackData = {};
-    data.records.forEach(function(rec){
-      var f=rec.fields, cid=f['SOPID']||'';
+    rows.forEach(function(rec){
+      var cid=rec.sopid||'';
       if (!cid) return;
       if (!feedbackData[cid]) feedbackData[cid]=[];
-      feedbackData[cid].push({id:rec.id,recordId:rec.id,cardId:cid,docName:f['SOP Title']||'',name:f['Name']||'Anonymous',type:f['Type']||'other',text:f['Text']||'',status:f['Status']||'open',date:f['Timestamp']||''});
+      feedbackData[cid].push({id:rec.id,recordId:rec.id,cardId:cid,docName:rec.sop_title||'',name:rec.author||'Anonymous',type:rec.type||'other',text:rec.text||'',status:rec.status||'open',date:fmtDate(rec.created_at)});
     });
     Object.keys(feedbackData).forEach(function(id){ renderFeedbackInCard(id); });
     updateFeedbackBadges(); updateFeedbackHub();
@@ -1573,7 +1582,7 @@ function addMissing() {
   var d=document.getElementById('missDesc').value.trim();
   if(!n){ alert('Please enter a SOP name.'); return; }
   var ts=new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
-  atReq('Missing SOPs','POST',{fields:{'Name':n,'Description':d||'','Timestamp':ts}}).then(function(){ loadMissing(); });
+  sbReq('missing_sops','POST',{name:n, description:d||'', status:'open'}).then(function(){ loadMissing(); });
   document.getElementById('missName').value='';
   document.getElementById('missDesc').value='';
 }
@@ -1588,18 +1597,17 @@ function appendMissing(n,d,recordId) {
 }
 function saveMissing() {}
 function loadMissing() {
-  atReq('Missing SOPs?maxRecords=200').then(function(data){
-    if (!data||!data.records) return;
+  sbReq('missing_sops?select=*&order=id.asc').then(function(rows){
+    if (!rows||!Array.isArray(rows)) return;
     document.querySelectorAll('#missingList [data-dynamic]').forEach(function(el){ el.remove(); });
     var addedNames=[];
-    data.records.forEach(function(rec){ if((rec.fields['Status']||'')==='added') addedNames.push(rec.fields['Name']||''); });
+    rows.forEach(function(rec){ if((rec.status||'')==='added') addedNames.push(rec.name||''); });
     document.querySelectorAll('#missingList .miss-item:not([data-dynamic])').forEach(function(el){
       var t=el.querySelector('.miss-title');
       el.style.display=(t&&addedNames.indexOf(t.textContent)!==-1)?'none':'';
     });
-    data.records.forEach(function(rec){
-      var f=rec.fields;
-      if((f['Status']||'')!=='added') appendMissing(f['Name']||'',f['Description']||'',rec.id);
+    rows.forEach(function(rec){
+      if((rec.status||'')!=='added') appendMissing(rec.name||'', rec.description||'', rec.id);
     });
     updateMissingCount();
   });
